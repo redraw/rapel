@@ -1,40 +1,85 @@
-# httpchunk
-```
-httpchunk - Download a single HTTP/HTTPS URL into numbered chunk files using Range requests.
+# rapel
 
-State model (files in current directory):
-  <name>.XXXXXX.tmp   -> in progress
-  <name>.XXXXXX.part  -> completed chunk
-  <name>.XXXXXX.done  -> completion marker (source of truth)
+Chunked HTTP downloader with resume support.
 
-Usage:
-  httpchunk URL [options]
+A modern, cross-platform implementation with improved state management and progress tracking.
 
-Options:
-  -c CHUNK_SIZE     Chunk size (K, M, G decimal). Default: 100M
-  -x PROXY          curl proxy URL
-  -r RETRIES        Retries per request. Default: 10
-  --no-head         Skip HEAD (requires --size)
-  --size BYTES      Total size in bytes (required if --no-head)
-  --index-width N   Digits for chunk index. Default: 6
-  --jobs N          Concurrent chunks. Default: 1
-  --force           Re-download even if .done exists
-  --post-part CMD   Run after a chunk completes.
-                    Placeholders: {part} {done} {idx} {base}
-  --assemble FILE   Concatenate all *.part into FILE
-  --help            Show this help
-```
-
-## Upload while download
+### Installation
 
 ```bash
-while true; do
-  find . -maxdepth 1 -name '*.part' -print -quit | grep -q . && rclone move . r2:tmp/ --include='*.part' --max-depth 1 -v;
-  sleep 5;
-done
+go build -o bin/rapel
 ```
 
-## Merge parts (and delete parts while merging)
+Or install directly:
 ```bash
-./mergeparts -o <OUTPUT> --pattern "*.parts" --delete
+go install github.com/redraw/rapel@latest
+```
+
+### Usage
+
+Download a file with default settings (100MB chunks, 1 concurrent job):
+```bash
+rapel download https://example.com/file.bin
+```
+
+Download with custom chunk size and multiple concurrent downloads:
+```bash
+rapel download https://example.com/file.bin -c 50M --jobs 4
+```
+
+Download through a proxy:
+```bash
+rapel download https://example.com/file.bin -x socks5h://127.0.0.1:9050
+```
+
+Download and auto-merge:
+```bash
+rapel download https://example.com/file.bin --merge
+```
+
+Run command after each chunk completes:
+```bash
+rapel download https://example.com/file.bin --post-part 'rclone move {part} remote:bucket/'
+```
+
+Merge chunk files manually:
+```bash
+rapel merge                                    # Auto-detects output name
+rapel merge --pattern 'file.*.part'           # Auto-detects as "file"
+rapel merge -o output.bin --delete            # Explicit name, delete after merge
+```
+
+### Features
+
+- **JSON state management**: Single `.rapel-state.json` file tracks all chunk metadata
+- **Graceful shutdown**: Ctrl+C saves progress and allows resume
+- **Better progress display**: Real-time speed, completion status with ANSI formatting
+- **Cross-platform**: Works on Linux (amd64, arm64, arm v6/v7), macOS (Intel/Apple Silicon), Windows, and FreeBSD
+- **Raspberry Pi support**: Native ARM v7 and v6 binaries for all Raspberry Pi models
+- **Resume support**: Automatically resumes interrupted downloads
+- **Concurrent downloads**: Download multiple chunks simultaneously
+- **Post-part hooks**: Run custom commands after each chunk completes (e.g., upload to cloud)
+- **Smart merging**: Auto-detects output filename and handles multiple download sessions
+
+### Options
+
+**Download command:**
+```
+-c SIZE          Chunk size (K, M, G suffix). Default: 100M
+-x URL           Proxy URL (e.g., socks5h://127.0.0.1:9050)
+-r N             Retries per request. Default: 10
+--no-head        Skip HEAD request (requires --size)
+--size BYTES     Total size in bytes (required if --no-head)
+--jobs N         Concurrent chunks. Default: 1
+--force          Force re-download even if state exists
+--merge          Merge chunks after download (auto-detects output name)
+--post-part CMD  Command to run after each part completes
+                 Placeholders: {part} {idx} {base}
+```
+
+**Merge command:**
+```
+-o FILE        Output filename (auto-detected if not provided)
+--pattern GLOB Pattern for chunk files. Default: *.part
+--delete       Delete chunk files after merging
 ```

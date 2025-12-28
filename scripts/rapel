@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-httpchunk - Download a single HTTP/HTTPS URL into numbered chunk files using Range requests.
+rapel - Download a single HTTP/HTTPS URL into numbered chunk files using Range requests.
 
 State model (files in current directory):
   <name>.XXXXXX.tmp   -> in progress
@@ -11,7 +11,7 @@ State model (files in current directory):
   <name>.XXXXXX.done  -> completion marker (source of truth)
 
 Usage:
-  httpchunk URL [options]
+  rapel URL [options]
 
 Options:
   -c CHUNK_SIZE     Chunk size (K, M, G decimal). Default: 100M
