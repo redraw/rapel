@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	httpclient "github.com/redraw/rapel/internal/http"
 )
@@ -234,50 +235,94 @@ func (d *Downloader) downloadAllChunks(ctx context.Context) error {
 	return nil
 }
 
-// downloadChunk downloads a single chunk with resume support
+// downloadChunk downloads a single chunk with resume support and retry logic
 func (d *Downloader) downloadChunk(ctx context.Context, index int, chunk *ChunkInfo) error {
 	tmpPath := d.state.GetChunkTmpFilename(index)
 	partPath := d.state.GetChunkFilename(index)
 
-	// Open chunk file (will resume if .tmp exists)
-	chunkFile, currentSize, err := OpenChunkFile(tmpPath, partPath)
-	if err != nil {
-		if err.Error() == "chunk already complete" {
-			return nil
-		}
-		return err
-	}
-	defer chunkFile.Close()
+	var lastErr error
+	maxRetries := d.config.HTTPConfig.MaxRetries
 
-	// Calculate resume position
-	resumeStart := chunk.Start + currentSize
-	if resumeStart > chunk.End {
-		resumeStart = chunk.End + 1
-	}
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Exponential backoff on retry
+		if attempt > 0 {
+			backoffSecs := min(pow2(attempt), 60.0)
+			backoff := time.Duration(backoffSecs * float64(time.Second))
 
-	// Download remaining bytes
-	if resumeStart <= chunk.End {
-		// Create progress writer that updates progress tracker
-		progressWriter := &progressWriter{
-			writer:   chunkFile,
-			tracker:  d.progress,
-			chunkIdx: index,
-			current:  currentSize,
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
 		}
 
-		err = d.client.DownloadRange(ctx, d.state.URL, resumeStart, chunk.End, progressWriter)
+		// Open/reopen chunk file (will resume if .tmp exists)
+		chunkFile, currentSize, err := OpenChunkFile(tmpPath, partPath)
 		if err != nil {
-			d.progress.PrintError(index, err)
+			if err.Error() == "chunk already complete" {
+				return nil
+			}
 			return err
 		}
+
+		// Calculate resume position
+		resumeStart := chunk.Start + currentSize
+		if resumeStart > chunk.End {
+			resumeStart = chunk.End + 1
+		}
+
+		// Download remaining bytes
+		if resumeStart <= chunk.End {
+			// Create progress writer that updates progress tracker
+			progressWriter := &progressWriter{
+				writer:   chunkFile,
+				tracker:  d.progress,
+				chunkIdx: index,
+				current:  currentSize,
+			}
+
+			err = d.client.DownloadRange(ctx, d.state.URL, resumeStart, chunk.End, progressWriter)
+			if err != nil {
+				chunkFile.Close()
+				lastErr = err
+
+				// Don't retry on context cancellation
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+
+				// Retry
+				continue
+			}
+		}
+
+		// Finalize chunk (rename .tmp to .part)
+		if err := chunkFile.Finalize(); err != nil {
+			return fmt.Errorf("failed to finalize chunk: %w", err)
+		}
+
+		return nil
 	}
 
-	// Finalize chunk (rename .tmp to .part)
-	if err := chunkFile.Finalize(); err != nil {
-		return fmt.Errorf("failed to finalize chunk: %w", err)
-	}
+	d.progress.PrintError(index, lastErr)
+	return fmt.Errorf("download failed after %d retries: %w", maxRetries, lastErr)
+}
 
-	return nil
+// pow2 returns 2^n as a float64
+func pow2(n int) float64 {
+	result := 1.0
+	for i := 0; i < n; i++ {
+		result *= 2.0
+	}
+	return result
+}
+
+// min returns the minimum of two float64 values
+func min(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // GetState returns the current state

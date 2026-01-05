@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"time"
@@ -77,37 +76,9 @@ func (c *Client) GetContentLength(ctx context.Context, url string) (int64, error
 	return resp.ContentLength, nil
 }
 
-// DownloadRange downloads a byte range with retry logic
+// DownloadRange downloads a byte range (no retry, caller handles retries)
 func (c *Client) DownloadRange(ctx context.Context, url string, start, end int64, writer io.Writer) error {
-	var lastErr error
-
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 2^attempt seconds, max 60s
-			backoffSecs := math.Min(math.Pow(2, float64(attempt)), 60)
-			backoff := time.Duration(backoffSecs) * time.Second
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-		}
-
-		err := c.downloadRangeOnce(ctx, url, start, end, writer)
-		if err == nil {
-			return nil
-		}
-
-		lastErr = err
-
-		// Don't retry on context cancellation
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-	}
-
-	return fmt.Errorf("download failed after %d retries: %w", c.config.MaxRetries, lastErr)
+	return c.downloadRangeOnce(ctx, url, start, end, writer)
 }
 
 // downloadRangeOnce attempts to download a byte range once
@@ -131,27 +102,46 @@ func (c *Client) downloadRangeOnce(ctx context.Context, url string, start, end i
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// Copy with context cancellation check
+	// Calculate expected bytes to enforce download limit
+	expectedBytes := end - start + 1
+
+	// Copy with context cancellation check and byte limit enforcement
 	buf := make([]byte, 32*1024)
-	for {
+	var totalRead int64
+	for totalRead < expectedBytes {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		n, err := resp.Body.Read(buf)
+		// Calculate how many bytes to read in this iteration
+		remaining := expectedBytes - totalRead
+		readSize := len(buf)
+		if remaining < int64(readSize) {
+			readSize = int(remaining)
+		}
+
+		n, err := resp.Body.Read(buf[:readSize])
 		if n > 0 {
+			totalRead += int64(n)
 			if _, writeErr := writer.Write(buf[:n]); writeErr != nil {
 				return fmt.Errorf("write failed: %w", writeErr)
 			}
 		}
 
 		if err == io.EOF {
-			return nil
+			break
 		}
 		if err != nil {
 			return fmt.Errorf("read failed: %w", err)
 		}
 	}
+
+	// Verify we received the expected number of bytes
+	if totalRead != expectedBytes {
+		return fmt.Errorf("incomplete download: expected %d bytes, got %d", expectedBytes, totalRead)
+	}
+
+	return nil
 }
