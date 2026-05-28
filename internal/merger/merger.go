@@ -145,7 +145,7 @@ func (m *Merger) mergeGroup(outputName string, basenameGroups map[string][]strin
 
 	// Delete state file if requested
 	if m.config.Delete {
-		stateFile := fmt.Sprintf(".%s-state.json", outputName)
+		stateFile := fmt.Sprintf(".%s-args.json", outputName)
 		if err := os.Remove(stateFile); err != nil {
 			if !os.IsNotExist(err) {
 				fmt.Printf("Warning: failed to delete state file %s: %v\n", stateFile, err)

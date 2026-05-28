@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -33,11 +34,11 @@ func (c *Config) HasPostPartCmd() bool {
 // Downloader manages the chunked download process
 type Downloader struct {
 	config     Config
-	state      *State
+	args       *DownloadArguments
 	client     *httpclient.Client
 	progress   *ProgressTracker
 	postPartWg sync.WaitGroup
-	postPartCh chan int // Channel for post-part worker pool
+	postPartCh chan int
 }
 
 // NewDownloader creates a new Downloader
@@ -47,141 +48,129 @@ func NewDownloader(config Config) (*Downloader, error) {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
 
-	d := &Downloader{
+	return &Downloader{
 		config: config,
 		client: client,
-	}
-
-	return d, nil
+	}, nil
 }
 
 // Download performs the chunked download
 func (d *Downloader) Download(ctx context.Context) error {
-	// Extract filename prefix from URL
 	prefix := extractFilenameFromURL(d.config.URL)
 	if prefix == "" {
 		prefix = "download"
 	}
 
-	// Check for existing state
-	var err error
+	// Load existing args if not forcing a fresh start
+	var existingArgs *DownloadArguments
 	if !d.config.Force {
-		d.state, err = LoadState(prefix)
+		var err error
+		existingArgs, err = LoadDownloadArguments(prefix)
 		if err != nil {
-			return fmt.Errorf("failed to load state: %w", err)
+			return fmt.Errorf("failed to load args: %w", err)
 		}
 	}
 
 	// Get content length if not provided
 	totalSize := d.config.TotalSize
 	if totalSize == 0 {
+		var err error
 		totalSize, err = d.client.GetContentLength(ctx, d.config.URL)
 		if err != nil {
 			return fmt.Errorf("failed to get content length: %w", err)
 		}
 	}
 
-	// Create new state if needed
-	if d.state == nil {
-		d.state = NewState(d.config.URL, totalSize, d.config.ChunkSize, prefix)
-	}
-
-	// Validate state matches current config
-	if d.state.URL != d.config.URL || d.state.TotalSize != totalSize {
+	// Validate loaded args or create fresh ones
+	if existingArgs != nil && (existingArgs.URL != d.config.URL || existingArgs.TotalSize != totalSize) {
 		if !d.config.Force {
-			return fmt.Errorf("existing state doesn't match URL/size, use --force to restart")
+			return fmt.Errorf("existing args don't match URL/size, use --force to restart")
 		}
-		d.state = NewState(d.config.URL, totalSize, d.config.ChunkSize, prefix)
+		existingArgs = nil
 	}
 
-	// Create progress tracker
-	d.progress = NewProgressTracker(d.state)
+	if existingArgs != nil {
+		d.args = existingArgs
+	} else {
+		d.args = NewDownloadArguments(d.config.URL, totalSize, d.config.ChunkSize, prefix)
+		if err := d.args.Save(); err != nil {
+			return fmt.Errorf("failed to save args: %w", err)
+		}
+	}
 
-	// Print download info
+	// Build progress tracker
+	d.progress = NewProgressTracker(d.args)
+
+	// Seed progress from on-disk chunk files (resume detection)
+	for i := 0; i < d.args.NumChunks(); i++ {
+		if _, err := os.Stat(d.args.PartPath(i)); err == nil {
+			// .part exists: chunk is complete
+			d.progress.MarkComplete(i)
+		} else if info, err := os.Stat(d.args.TmpPath(i)); err == nil {
+			// .tmp exists: partially downloaded; seed for display but don't mark complete
+			size := info.Size()
+			if size > d.args.ChunkSizeAt(i) {
+				size = d.args.ChunkSizeAt(i)
+			}
+			d.progress.SeedChunk(i, size)
+		}
+	}
+
 	fmt.Printf("URL        : %s\n", d.config.URL)
 	fmt.Printf("File       : %s\n", prefix)
 	fmt.Printf("Size       : %s\n", formatBytes(totalSize))
 	fmt.Printf("Chunk size : %s\n", formatBytes(d.config.ChunkSize))
-	fmt.Printf("Chunks     : %d\n", len(d.state.Chunks))
+	fmt.Printf("Chunks     : %d\n", d.args.NumChunks())
 	fmt.Printf("Jobs       : %d\n", d.config.MaxConcurrency)
 	fmt.Println()
 
-	// Download all chunks
 	if err := d.downloadAllChunks(ctx); err != nil {
 		return err
 	}
 
 	d.progress.PrintComplete()
 
-	// Delete state file after successful completion
-	if err := d.state.Delete(); err != nil {
-		return fmt.Errorf("failed to delete state file: %w", err)
+	if err := d.args.Delete(); err != nil {
+		return fmt.Errorf("failed to delete args file: %w", err)
 	}
 
 	return nil
 }
 
-// downloadAllChunks downloads all chunks using a worker pool with sequential dispatch
+// downloadAllChunks downloads all chunks using a worker pool
 func (d *Downloader) downloadAllChunks(ctx context.Context) error {
-	// Create context that can be cancelled on first error
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Create work channel and error channel
-	type workItem struct {
-		index         int
-		chunk         *ChunkInfo
-		needsDownload bool
-		needsPostPart bool
-	}
-	workChan := make(chan workItem)
+	workChan := make(chan int)
 	errChan := make(chan error, 1)
 
-	// Start post-part workers if post-part command is configured
 	if d.config.HasPostPartCmd() {
-		// Use buffered channel to avoid blocking download workers
-		d.postPartCh = make(chan int, len(d.state.Chunks))
+		d.postPartCh = make(chan int, d.args.NumChunks())
 		d.startPostPartWorkers()
 	}
 
-	// Launch worker goroutines
 	var wg sync.WaitGroup
 	for i := 0; i < d.config.MaxConcurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for work := range workChan {
-				// Download chunk if needed
-				if work.needsDownload {
-					if err := d.downloadChunk(ctx, work.index, work.chunk); err != nil {
-						select {
-						case errChan <- fmt.Errorf("chunk %d: %w", work.index, err):
-							cancel() // Cancel other downloads on error
-						default:
-						}
-						return
+			for index := range workChan {
+				if err := d.downloadChunk(ctx, index); err != nil {
+					select {
+					case errChan <- fmt.Errorf("chunk %d: %w", index, err):
+						cancel()
+					default:
 					}
-
-					// Mark as completed and save state
-					d.state.MarkChunkCompleted(work.index, work.chunk.End-work.chunk.Start+1)
-					d.progress.PrintChunkComplete(work.index)
-
-					if err := d.state.Save(); err != nil {
-						select {
-						case errChan <- fmt.Errorf("failed to save state: %w", err):
-						default:
-						}
-						return
-					}
-				} else if work.needsPostPart {
-					// Chunk is complete but post-part needs retry
-					d.progress.PrintMessage("Retrying post-part for chunk %d", work.index)
+					return
 				}
 
-				// Send to post-part worker pool if configured
+				d.progress.MarkComplete(index)
+				d.progress.PrintChunkComplete(index)
+
 				if d.config.HasPostPartCmd() {
 					select {
-					case d.postPartCh <- work.index:
+					case d.postPartCh <- index:
 					case <-ctx.Done():
 						return
 					}
@@ -190,44 +179,39 @@ func (d *Downloader) downloadAllChunks(ctx context.Context) error {
 		}()
 	}
 
-	// Dispatch chunks in sequential order
+	// Dispatch chunks: skip complete ones, send incomplete to workers
 	go func() {
 		defer close(workChan)
-		for i, chunk := range d.state.Chunks {
-			// Check if we need to process this chunk
-			needsDownload := !chunk.Completed
-			needsPostPart := chunk.Completed && d.config.HasPostPartCmd() && !chunk.PostPartCompleted
-
-			// Skip if already complete and no post-part work needed
-			if !needsDownload && !needsPostPart {
+		for i := 0; i < d.args.NumChunks(); i++ {
+			if d.progress.IsChunkComplete(i) {
+				// Already done — enqueue post-part (at-least-once on resume)
+				if d.config.HasPostPartCmd() {
+					select {
+					case d.postPartCh <- i:
+					case <-ctx.Done():
+						return
+					}
+				}
 				continue
 			}
 
 			select {
-			case workChan <- workItem{
-				index:         i,
-				chunk:         chunk,
-				needsDownload: needsDownload,
-				needsPostPart: needsPostPart,
-			}:
+			case workChan <- i:
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
-	// Wait for all workers to finish
 	wg.Wait()
 	close(errChan)
 
-	// Close post-part channel and wait for workers
 	if d.config.HasPostPartCmd() {
 		close(d.postPartCh)
 		d.progress.PrintMessage("Waiting for post-part commands to complete...")
 		d.postPartWg.Wait()
 	}
 
-	// Return first error if any
 	if err := <-errChan; err != nil {
 		return err
 	}
@@ -236,15 +220,15 @@ func (d *Downloader) downloadAllChunks(ctx context.Context) error {
 }
 
 // downloadChunk downloads a single chunk with resume support and retry logic
-func (d *Downloader) downloadChunk(ctx context.Context, index int, chunk *ChunkInfo) error {
-	tmpPath := d.state.GetChunkTmpFilename(index)
-	partPath := d.state.GetChunkFilename(index)
+func (d *Downloader) downloadChunk(ctx context.Context, index int) error {
+	start, end := d.args.ChunkRange(index)
+	tmpPath := d.args.TmpPath(index)
+	partPath := d.args.PartPath(index)
 
 	var lastErr error
 	maxRetries := d.config.HTTPConfig.MaxRetries
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// Exponential backoff on retry
 		if attempt > 0 {
 			backoffSecs := min(pow2(attempt), 60.0)
 			backoff := time.Duration(backoffSecs * float64(time.Second))
@@ -256,7 +240,6 @@ func (d *Downloader) downloadChunk(ctx context.Context, index int, chunk *ChunkI
 			}
 		}
 
-		// Open/reopen chunk file (will resume if .tmp exists)
 		chunkFile, currentSize, err := OpenChunkFile(tmpPath, partPath)
 		if err != nil {
 			if err.Error() == "chunk already complete" {
@@ -265,38 +248,36 @@ func (d *Downloader) downloadChunk(ctx context.Context, index int, chunk *ChunkI
 			return err
 		}
 
-		// Calculate resume position
-		resumeStart := chunk.Start + currentSize
-		if resumeStart > chunk.End {
-			resumeStart = chunk.End + 1
+		// Seed the progress display from the resume offset
+		if currentSize > 0 {
+			d.progress.SeedChunk(index, currentSize)
 		}
 
-		// Download remaining bytes
-		if resumeStart <= chunk.End {
-			// Create progress writer that updates progress tracker
+		resumeStart := start + currentSize
+		if resumeStart > end {
+			resumeStart = end + 1
+		}
+
+		if resumeStart <= end {
 			progressWriter := &progressWriter{
 				writer:   chunkFile,
 				tracker:  d.progress,
 				chunkIdx: index,
-				current:  currentSize,
 			}
 
-			err = d.client.DownloadRange(ctx, d.state.URL, resumeStart, chunk.End, progressWriter)
+			err = d.client.DownloadRange(ctx, d.args.URL, resumeStart, end, progressWriter)
 			if err != nil {
 				chunkFile.Close()
 				lastErr = err
 
-				// Don't retry on context cancellation
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 
-				// Retry
 				continue
 			}
 		}
 
-		// Finalize chunk (rename .tmp to .part)
 		if err := chunkFile.Finalize(); err != nil {
 			return fmt.Errorf("failed to finalize chunk: %w", err)
 		}
@@ -325,14 +306,13 @@ func min(a, b float64) float64 {
 	return b
 }
 
-// GetState returns the current state
-func (d *Downloader) GetState() *State {
-	return d.state
+// GetArguments returns the current download arguments.
+func (d *Downloader) GetArguments() *DownloadArguments {
+	return d.args
 }
 
 // extractFilenameFromURL extracts a filename from a URL
 func extractFilenameFromURL(url string) string {
-	// Remove query string and fragment
 	base := url
 	for _, sep := range []string{"?", "#"} {
 		if idx := len(base) - 1; idx >= 0 {
@@ -345,7 +325,6 @@ func extractFilenameFromURL(url string) string {
 		}
 	}
 
-	// Extract filename from path
 	return filepath.Base(base)
 }
 
@@ -354,28 +333,24 @@ type progressWriter struct {
 	writer   *ChunkFile
 	tracker  *ProgressTracker
 	chunkIdx int
-	current  int64
 }
 
 func (pw *progressWriter) Write(p []byte) (n int, err error) {
 	n, err = pw.writer.Write(p)
 	if n > 0 {
-		pw.current += int64(n)
-		pw.tracker.AddBytes(int64(n))
-		pw.tracker.PrintProgress(pw.chunkIdx, pw.current)
+		pw.tracker.AddBytes(pw.chunkIdx, int64(n))
+		pw.tracker.PrintProgress(pw.chunkIdx)
 	}
 	return
 }
 
 // startPostPartWorkers launches worker pool for post-part commands
 func (d *Downloader) startPostPartWorkers() {
-	// Determine number of workers (default to unlimited if 0)
 	numWorkers := d.config.PostPartConcurrency
 	if numWorkers == 0 {
-		numWorkers = 10 // Reasonable default for unlimited
+		numWorkers = 10
 	}
 
-	// Launch workers
 	for i := 0; i < numWorkers; i++ {
 		d.postPartWg.Add(1)
 		go d.postPartWorker()
@@ -387,37 +362,27 @@ func (d *Downloader) postPartWorker() {
 	defer d.postPartWg.Done()
 
 	for index := range d.postPartCh {
-		partPath := d.state.GetChunkFilename(index)
+		partPath := d.args.PartPath(index)
 
-		// Substitute placeholders
 		cmd := d.config.PostPartCmd
 		cmd = strings.ReplaceAll(cmd, "{part}", partPath)
 		cmd = strings.ReplaceAll(cmd, "{idx}", strconv.Itoa(index))
-		cmd = strings.ReplaceAll(cmd, "{base}", d.state.FilenamePrefix)
+		cmd = strings.ReplaceAll(cmd, "{base}", d.args.FilenamePrefix)
 
 		d.progress.PrintCmdMessage("[post-part chunk %d] Running: %s", index, cmd)
 
-		// Execute command using shell and capture output
 		execCmd := exec.Command("sh", "-c", cmd)
 		output, err := execCmd.CombinedOutput()
 
 		if len(output) > 0 {
-			// Indent each line of output
 			indented := "  " + strings.ReplaceAll(strings.TrimSpace(string(output)), "\n", "\n  ")
 			d.progress.PrintCmdMessage("[post-part chunk %d] Output:\n%s", index, indented)
 		}
 
 		if err != nil {
 			d.progress.PrintCmdMessage("[post-part chunk %d] Failed: %v", index, err)
-			d.state.MarkPostPartCompleted(index, false)
 		} else {
 			d.progress.PrintCmdMessage("[post-part chunk %d] Completed", index)
-			d.state.MarkPostPartCompleted(index, true)
-		}
-
-		// Save state after post-part completion
-		if err := d.state.Save(); err != nil {
-			d.progress.PrintCmdMessage("[post-part chunk %d] Warning: failed to save state: %v", index, err)
 		}
 	}
 }

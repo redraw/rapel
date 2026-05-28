@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -130,12 +131,8 @@ Examples:
 
 	// Perform download
 	if err := dl.Download(ctx); err != nil {
-		if err == context.Canceled {
+		if errors.Is(err, context.Canceled) {
 			fmt.Println("Download cancelled")
-			// Save state before exit
-			if state := dl.GetState(); state != nil {
-				state.Save()
-			}
 			return nil
 		}
 		return err
@@ -145,8 +142,8 @@ Examples:
 	if *merge {
 		fmt.Println("\nMerging chunks...")
 
-		state := dl.GetState()
-		pattern := fmt.Sprintf("%s.*.part", state.FilenamePrefix)
+		args := dl.GetArguments()
+		pattern := fmt.Sprintf("%s.*.part", args.FilenamePrefix)
 
 		m := merger.NewMerger(merger.Config{
 			Output:  "", // Auto-detect output name

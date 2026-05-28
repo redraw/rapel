@@ -24,22 +24,22 @@ rapel download https://example.com/file.bin
 
 Download with custom chunk size and multiple concurrent downloads:
 ```bash
-rapel download https://example.com/file.bin -c 50M --jobs 4
+rapel download -c 50M --jobs 4 https://example.com/file.bin
 ```
 
 Download through a proxy:
 ```bash
-rapel download https://example.com/file.bin -x socks5h://127.0.0.1:9050
+rapel download -x socks5h://127.0.0.1:9050 https://example.com/file.bin
 ```
 
 Download and auto-merge:
 ```bash
-rapel download https://example.com/file.bin --merge
+rapel download --merge https://example.com/file.bin
 ```
 
 Run command after each chunk completes:
 ```bash
-rapel download https://example.com/file.bin --post-part 'rclone move {part} remote:bucket/'
+rapel download --post-part 'rclone move {part} remote:bucket/' https://example.com/file.bin
 ```
 
 Merge chunk files manually:
@@ -51,35 +51,45 @@ rapel merge -o output.bin --delete            # Explicit name, delete after merg
 
 ### Features
 
-- **JSON state management**: Single `.rapel-state.json` file tracks all chunk metadata
-- **Graceful shutdown**: Ctrl+C saves progress and allows resume
+- **Argument persistence**: a `.{prefix}-args.json` file records the URL, chunk size, and total size so resumes can validate they're continuing the right download
+- **Graceful shutdown**: Ctrl+C is safe — resume reconstructs progress from the on-disk `.tmp` / `.part` files
 - **Better progress display**: Real-time speed, completion status with ANSI formatting
 - **Cross-platform**: Works on Linux (amd64, arm64, arm v6/v7), macOS (Intel/Apple Silicon), Windows, and FreeBSD
 - **Raspberry Pi support**: Native ARM v7 and v6 binaries for all Raspberry Pi models
 - **Resume support**: Automatically resumes interrupted downloads
 - **Concurrent downloads**: Download multiple chunks simultaneously
-- **Post-part hooks**: Run custom commands after each chunk completes (e.g., upload to cloud)
+- **Post-part hooks**: Run custom commands after each chunk completes (e.g., upload to cloud). Hooks are at-least-once: on resume, hooks may run again for already-completed chunks. Write hooks to be idempotent.
 - **Smart merging**: Auto-detects output filename and handles multiple download sessions
 
 ### Options
 
 **Download command:**
+
+> Flags must be specified BEFORE the URL argument.
+
 ```
--c SIZE          Chunk size (K, M, G suffix). Default: 100M
--x URL           Proxy URL (e.g., socks5h://127.0.0.1:9050)
--r N             Retries per request. Default: 10
---no-head        Skip HEAD request (requires --size)
---size BYTES     Total size in bytes (required if --no-head)
---jobs N         Concurrent chunks. Default: 1
---force          Force re-download even if state exists
---merge          Merge chunks after download (auto-detects output name)
---post-part CMD  Command to run after each part completes
-                 Placeholders: {part} {idx} {base}
+-c SIZE              Chunk size (K, M, G suffix). Default: 100M
+-x URL               Proxy URL (e.g., socks5h://127.0.0.1:9050)
+-r N                 Retries per request. Default: 10
+--no-head            Skip HEAD request (requires --size)
+--size BYTES         Total size in bytes (required if --no-head)
+--jobs N             Concurrent chunks. Default: 1
+--force              Force re-download, ignoring any existing args file or chunk files
+--merge              Merge chunks after download (auto-detects output name)
+--post-part CMD      Command to run after each part completes
+                     Placeholders: {part} {idx} {base}
+--post-part-jobs N   Max concurrent post-part commands. Default: 0 (unlimited)
 ```
+
+### State files
+
+- `.{prefix}-args.json` — records the URL, total size, chunk size, and filename prefix used at start; written once at start, removed on success. Resuming with a different URL or size requires `--force`. Runtime flags (`--jobs`, `--post-part`, proxy, retries, etc.) are not persisted and can change between runs.
+- `<prefix>.NNNNNN.tmp` — chunk download in progress
+- `<prefix>.NNNNNN.part` — chunk fully downloaded
 
 **Merge command:**
 ```
 -o FILE        Output filename (auto-detected if not provided)
 --pattern GLOB Pattern for chunk files. Default: *.part
---delete       Delete chunk files after merging
+--delete       Delete chunk files and args file after merging
 ```
