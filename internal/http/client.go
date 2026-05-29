@@ -1,3 +1,4 @@
+// Package http provides an HTTP client with retry logic and support for byte-range requests.
 package http
 
 import (

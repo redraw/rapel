@@ -1,3 +1,4 @@
+// Package downloader implements chunked HTTP range downloads with a concurrent worker pool and resume capability.
 package downloader
 
 import (

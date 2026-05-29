@@ -1,3 +1,4 @@
+// Package cmd implements the rapel CLI subcommands: download and merge.
 package cmd
 
 import (

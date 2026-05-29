@@ -1,3 +1,4 @@
+// Package merger concatenates ordered chunk files (.part) into a single output file.
 package merger
 
 import (
